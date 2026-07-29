@@ -1,3 +1,5 @@
+
+# %%
 import torch
 import numpy as np
 import s3fs
@@ -66,7 +68,7 @@ class S3FlowDataset(torch.utils.data.Dataset):
             self._fs = s3fs.S3FileSystem(profile='default', client_kwargs={
                 'endpoint_url': 'http://localhost:9000',
             })
-            s3_map = s3fs.S3Map(root=file_path, s3=self.fs, check=False)
+            s3_map = s3fs.S3Map(root=file_path, s3=self._fs, check=False)
             self._s3_map = zarr.open(store=s3_map, mode="r")
 
     @property
@@ -83,13 +85,13 @@ class S3FlowDataset(torch.utils.data.Dataset):
 dataset = S3FlowDataset(0)
 dataloader = torch.utils.data.DataLoader(
     dataset, batch_size=16, shuffle=True,
-    num_workers=2, pin_memory=True,
+    num_workers=0, pin_memory=True,
 )
 
 loss_fn = nn.L1Loss()
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-
+# %%
 num_epochs = 1
 for epoch in range(num_epochs):
     epoch_loss = 0.0

@@ -8,7 +8,9 @@ fs = s3fs.S3FileSystem(profile='default', client_kwargs={
 })
 map = s3fs.S3Map(root=file_path, s3=fs, check=False)
 
+
 # %%
+
 
 z = zarr.open(store=map, mode="r")
 
