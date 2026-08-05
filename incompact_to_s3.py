@@ -60,7 +60,7 @@ def process_snapshot(data_folder, snapshot_path, dims, field_selection, z, i):
 
 def export_channel(fs, spacing):
     print("    Exporting channel data ...", end=" ")
-    map = s3fs.S3Map(root=f"{S3_BUCKET}/{STORE_PATH}/channel.zarr", s3=fs)
+    map = s3fs.S3Map(root=f"{Sn3_BUCKET}/{STORE_PATH}/channel.zarr", s3=fs)
     z = zarr.group(
         store=map,
     )
