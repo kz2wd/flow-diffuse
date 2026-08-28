@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "diffusers>=0.39.0",
+    "h5py>=3.16.0",
     "ipykernel>=7.3.0",
     "jupyter>=1.1.1",
     "lab>=8.10",
