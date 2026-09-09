@@ -16,5 +16,6 @@ dependencies = [
     "scipy>=1.15.3",
     "torch>=2.13.0",
     "tqdm>=4.69.1",
+    "trackio>=0.37.1",
     "zarr>=2.18.3",
 ]
