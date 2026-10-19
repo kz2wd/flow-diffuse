@@ -13,3 +13,7 @@ wheels/
 .ipynb_checkpoints
 
 data/
+
+.jupyter_ystore.db
+.jupyter/
+opencode.json
