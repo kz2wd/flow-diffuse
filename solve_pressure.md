@@ -1,164 +1,150 @@
-# Stretched (INcompact3d-faithful) pressure solve — findings & implementation plan
+# Pressure Poisson solver (stretched `y`) — implementation plan
 
 ## Goal
 
-A pressure Poisson solver that is faithful to **INcompact3d** on a **stretched `y` (wall) grid**,
-replacing the old uniform-only `pressure_solve`. It must pass:
+A pressure Poisson solver on a **stretched `y` (wall) grid** that we **understand fully**,
+replacing the old uniform-only `pressure_solve` (cell 50). It must pass:
 1. a **uniform** analytical test (control), and
-2. a **stretched** analytical test (INcompact3d `istret=2` grid, β=0.259).
+2. a **stretched** analytical test (INcompact3d `istret=2` grid, β=0.259, cell 64).
 
-Form:  `-∇²p = S = 2Q`,  `∇² = ∂xx + ∂yy + ∂zz`,  x/z periodic, y Neumann (two walls).
+## The equation (sign fixed 2026-07-08)
 
-Old solver: `pressure.py::compute_pressure` and the notebook's `pressure_solve` (uniform-only,
-stretched `rel_rmse ≈ 0.2`).
+```
+    ∇²p = 2Q
+```
+**Not** `-∇²p = 2Q`. Derivation (incompressible NS, no body force, ρ=1):
+- momentum `Du/Dt = -∇p + ν∇²u`; take divergence, use continuity → `∇²p = -[∂ᵢuⱼ ∂ⱼuᵢ]`.
+- notebook defines `Q = -½ Σ ∂ᵢuⱼ ∂ⱼuᵢ` (cell 14), so `Σ ∂ᵢuⱼ ∂ⱼuᵢ = -2Q`.
+- therefore `∇²p = -(-2Q) = 2Q`. ✓
+
+Cross-checks:
+- The old uniform solver (cell 50) builds a matrix whose main diagonal is the `∂yy` stencil
+  plus `K = -(kx²+kz²)` — i.e. it inverts `∇²p = 2Q`. Consistent.
+- Cell 64 uses `Q_exact = -3·p/2` for a test where `∇²p = -3p`: since `2Q = ∇²p = -3p`,
+  `Q = -3p/2`. Consistent.
+
+`∇² = ∂xx + ∂yy + ∂zz`, x/z periodic, y Neumann (two walls).
 
 ---
 
-## What INcompact3d actually does (`src/poisson.f90 :: poisson_010`, istret=2)
+## Decision: Path B — our own clean solver (NOT an INcompact3d replica)
 
-`poisson_010` = Neumann in Y, periodic in X & Z (line 663). `ny = ny_global - 1`.
+We initially tried to faithfully replicate INcompact3d's `poisson_010` (compact scheme +
+"post-processing" basis rotations + pentadiagonal `A_y`). That failed and is **abandoned**.
+Reasons (see "Why the INcompact3d-faithful route was dropped" below):
+- The y "post-processing" (mirror-pair + `ay,by` phase, `poisson.f90` L761-780 / L923-944)
+  is **not** a standalone invertible transform — its forward and inverse do not round-trip.
+  It is machinery specific to INcompact3d's compact scheme + staggered layout, not a clean
+  step in the abstract pressure solve. Replicating it half-understood was a recipe for failure.
 
-1. **Symmetry-fold the Y field** by even parity (lines 688-697): `rw2b(i,j)=rw2(i,2j-1)` and the
-   mirror, so only `ny = ny_global-1` points are carried.
-2. **FFT in X and Z** (periodic); normalize.
-3. **Post-processing** multiplies modes by `az,bz/ax,bx` (periodic) and `ay,by`=sin/cos (the Y
-   cosine/DCT basis) — INcompact3d's way of entering the compact-scheme basis.
-4. **The Y solve** (the non-diagonal part — lines 853-880, the `istret /= 3` branch):
-   ```fortran
-   cw2 (i,j) = cw2b(i, 2*j-1)   ! odd  Y indices
-   cw2c(i,j) = cw2b(i, 2*j)     ! even Y indices
-   call inversion5_v1(a , cw2 )  ! pentadiagonal (5-band) solve, matrix a
-   call inversion5_v1(a2, cw2c)  ! pentadiagonal (5-band) solve, matrix a2
-   ! ... interleave odd/even back
-   ```
-   i.e. **two pentadiagonal solves per (x,z) mode** = the Y solve. `inversion5_v1`
-   (`src/tools.f90` L1225) is a pentadiagonal Thomas-style solver.
-   - (For `istret==0` it instead just divides by `kxyz(i,j,k)` from `waves()` — the diagonal case.)
-5. **Backward post-processing** (Y, X, Z), IFFT back to physical.
+**Path B** solves the clean 1D BVP directly, with a generic dense solver. No compact scheme,
+no basis rotation, no fold/unfold, no pentadiagonal.
 
-### The matrix `a`/`a2` (built by `matrice_refinement()`, L1921+, istret=1/2 branch)
+### The clean problem
 
-Main diagonal:
+After a plain FFT in x/z, each (x,z) mode `(i,k)` satisfies a 1D problem in `y`:
 ```
-a(i,j) = -[ xk2(i)*transy(j)^2*transz(k)^2          ! X contribution
-        + zk2(k)*transy(j)^2*transx(i)^2           ! Z contribution
-        + xa0^2 * cw22(i,j)^2                       ! Y "uniform" part
-        + xa1^2 * cw22(i,j)*(cw22(i,j-1)+cw22(i,j+1)) ]  ! Y stretched coupling
+    (d²/dy² − λ) p = s,        λ = kx²[i] + kz²[k],   s = 2·Q̃[i,:,k]
 ```
-with `cw22(i,j) = transx(i)*yky(j)*transz(k)`, and for istret=2:
-```
-xa0 = alpha/pi + (1/2)/(beta*pi)
-xa1 = -(1/4)/(beta*pi)
-```
-Off-diagonals (±1, ±2 → pentadiagonal): `xa01*cw22*(cw22±)` and `xa1^2*(-cw22(j±1)*cw22(j±2))`.
+Neumann BCs at both walls. This is a standard self-adjoint 1D BVP. (For the `(i=0,k=0)`
+mode, λ=0 and `d²/dy²` has the constant nullspace → singular → skip it; it's the arbitrary
+pressure constant.)
 
-### The key realization
-`xa0` and `xa1` **are the stretched metrics** `ppy`/`pp4y`. Recall
-`ppy(η) = yly*(α/π + (1/(βπ))·sin²πη)` = a **constant + a cos(2πη) harmonic**. That single 2η
-harmonic is *why* Y-mode `j` couples to `j±2` (pentadiagonal), and `xa1` (the cos/sin-2η
-amplitude) is what generates the off-diagonals. So INcompact3d is doing exactly our **chain rule**:
+### Discretization (the part that must be right on a stretched grid)
+
+Use the **conservative (flux-form) second derivative** — the standard choice for a
+non-uniform grid, and it keeps the operator self-adjoint (symmetric matrix):
 ```
-d²/dy² = (1/ppy²)·∂ηη  −  (pp4y/ppy³)·∂η
-         \______/     \____/
-         diagonal    position-dependent -> a matrix in the Y-basis
+(p'')_j = ( 2 / (dy_j + dy_{j-1}) ) · [ (p_{j+1} − p_j)/dy_j  −  (p_j − p_{j-1})/dy_{j-1} ]
+```
+where `dy_j = y_j − y_{j-1}`. This is "apply d/dy twice, consistently."
+- **Tridiagonal.** Off-diagonal coupling between `j` and `j+1` is the single number
+  `2/(dy_j + dy_{j+1})`, appearing symmetrically → the matrix is **symmetric** (discrete
+  self-adjointness of `d²/dy²` with Neumann BCs).
+- **Walls (Neumann):** the end rows drop the ghost point → "half" stencils at `j=0` and
+  `j=ny-1` (one fewer off-diagonal contribution).
+- **Uniform limit:** reduces to the standard `(p_{j+1} − 2p_j + p_{j-1})/dy²` Laplacian.
+
+### Pipeline
+```
+1.  S̃ = fftn(2Q, axes=(x,y,z))                    (plain DFT, no post-processing)
+2.  precompute L_y (tridiagonal) from the y-grid — once, independent of (i,k)
+3.  for each (i,k), skip (i=0,k=0):
+        A = L_y − (kx²[i] + kz²[k])·I
+        p̃[i,:,k] = np.linalg.solve(A, S̃[i,:,k])     (generic dense solver)
+4.  p = ifftn(p̃, axes=(x,y,z))
+5.  (optional) remove the y-mean to fix the pressure constant
 ```
 
-### Coefficients (`src/schemes.f90` L891-899, the `...6` scheme)
-```
-2nd-deriv compact:  acix6*dx = 63/62,  bcix6*dx = 17/186,  alcaix6 = 9/62
-compact symbol:     wp(w) = [2*(63/62)sin(w/2) + 2*(17/186)sin(3w/2)] / [1 + 2*(9/62)cos(w)]
-                   xkx = nx*wp/xlx   (1st deriv);   xk2 = (nx*wp/xlx)^2  (2nd deriv = 1st^2)
-```
-Consistency check: `(a+3b)/(1+2α) = (63/62 + 3·17/186)/(1 + 2·9/62) = 1` exactly.
-**`fhat'' = fhat'^2` is correct** (poisson.f90: `xk2 = xkx**2`) — do NOT "fix" it.
+`kx`, `kz` are **plain** wavenumbers `2π·fftfreq(n, d)` (not compact symbols) — Path B uses a
+standard discretization, so plain spectral symbols are the correct x/z eigenvalues.
+
+### Complexity
+`ny ≈ 64`, `nx·nz ≈ 1024` modes → ~1024 dense solves of a 64×64 system. Trivial cost, and
+no banded-format fragility (we hit `solve_banded` layout bugs on the old route).
 
 ---
 
-## One real difference vs. our chain-rule sketch
+## Tests
 
-Our formula treats the directions as independent: `fhat2(kx) + d²/dy² + fhat2(kz)`.
-INcompact3d instead carries **cross correction factors** `transx·transy·transz` (the compact
-1st-deriv transfer function) on each term. For resolved (low) modes `trans ≈ 1`, so both reduce to
-the same thing — it only matters near the Nyquist. We use the **independent chain-rule model**
-(the user's own formula); add the `trans` coupling only if a test demands it.
+Test function (Neumann-compatible in y): `p = cos(2πx/Lx)·cos(πy/Ly)·cos(2πz/Lz)`.
+Then `∇²p = −K2·p` with `K2 = (2π/Lx)² + (π/Ly)² + (2π/Lz)²`, so `2Q = −K2·p`, i.e.
+**`Q = −(K2/2)·p`** (matches cell 64's `Q_exact = -3·p/2` for the `K2=3` case).
 
----
-
-## The implementation (cells 73-76 of `check_q-pressure.ipynb`)
-
-### Architecture
-1. `S = 2Q`.
-2. DFT in X (axis 1) and Z (axis 3) — periodic.
-3. Per (i,k) x/z mode, solve a **dense `ny×ny` system** in the Y direction:
-   ```
-   A(i,k) = (fhat2x(i) + fhat2z(k))·I + L_y
-   L_y   = -(1/ppy²)·(∂ηη)  +  (pp4y/ppy³)·(∂η)     (chain rule)
-   A·p_hat(i,:,k) = S_hat(i,:,k)
-   ```
-4. IFFT in X, Z; drop the Y-mean (null space).
-
-### The subtle bug we hit (and fixed)
-`∂η` maps cosine (Neumann) modes to **sine** modes — it is **not diagonal** in the pure DCT basis.
-A naive "orthonormalize the DCT matrix and use it as a diagonal basis" is **wrong**, because the
-cosine eigenfunctions of `∂ηη` are only orthogonal under the **weighted** (DCT) inner product
-(`w_0 = w_{ny-1} = 1`, else `2`), not the unweighted one.
-
-**Correct construction** (in `eta_operators`): build the operators in the uniform `η`-index grid
-(0..1) using the weighted-basis projection
-```
-analysis:  f_hat = diag(1/norm) @ Bcos @ diag(w) @ f
-D2 = Bcos.T @ diag(fhat2) @ analysis     # ∂ηη : cos -> cos
-D1 = Bsin.T @ diag(fhat1) @ analysis     # ∂η  : cos -> sin
-   fhat1 = -(1/dη)·wp(ω)                 # d/dη  cos_m -> -ω sin_m
-   fhat2 = -(1/dη)²·wp(ω)²               # ∂ηη cos_m eigenvalue (negative)
-   ω_m   = π·m/(ny-1),  dη = 1/(ny-1)
-```
-This passed analytic-derivative verification (cell 74):
-```
-d/deta   cos(πη)   rel err = 2.4e-12
-d2/deta2 cos(πη)   rel err = 7.6e-12
-d2/deta2 cos(5πη)  rel err = 7.5e-8   (6th-order compact, mode 5)
-```
-
-### Solver details
-- X/Z compact 2nd-deriv symbols: `fhat2x(i) = (wp(kx_i·Lx)/Lx)²`, `fhat2z` likewise
-  (`kx = 2π·fftfreq(nx, d=Lx)`).
-- Stretched `L_y = -diag(1/ppy²)@D2 + diag(pp4y/ppy³)@D1`.
-- Loop: `for i in nx, k in nz: A = (fhat2x[i]+fhat2z[k])*I + L_y; P[:,i,:,k] = solve(A, S_hat[:,i,:,k]).T`.
-
-### Grid / metrics
-- Stretched grid + `ppy` from `incompact_stretch` (cell 64, verified `y[0]=0, y[-1]=yly=π`).
-- `pp4y = d(ppy)/dη` computed **numerically** as `np.gradient(ppy, 1/(ny-1))` — robust and
-  consistent with the actual grid (avoids an analytic-formula mismatch).
-- Uniform control: `ppy = yly` (const), `pp4y = 0`.
-- Test function (Neumann-compatible): `p = cos(2πx/Lx)·cos(πy/Ly)·cos(2πz/Lz)`;
-  `-∇²p = K2·p`, `K2 = (2π/Lx)²+(π/Ly)²+(2π/Lz)²`; set `S = K2·p` (so `Q = S/2`).
+- **Uniform (control):** uniform y-grid. Expect `rel_rmse ~ 1e-10` (2nd-order accurate,
+  well-resolved single mode).
+- **Stretched (istret=2, β=0.259):** grid from `incompact_stretch` (cell 64). Expect
+  `rel_rmse` **small** (a few ×1e-3), *not* 0.2. It will be less accurate than
+  INcompact3d's 6th-order compact scheme (ours is 2nd-order in y), so the target is
+  "clearly correct," not "1e-6." Optionally confirm with a **grid-convergence check**
+  (2 resolutions, verify ~2nd-order convergence) to prove it's right rather than just small.
 
 ---
 
-## Status
+## Status / Next steps
 
-- **Operators** (`eta_operators`): **VERIFIED** against analytic derivatives (cell 74, above).
-- **`pressure_solve_v3`** (cells 73-76): written and fixed two bugs —
-  1. axis mix-up (`Shat[:,i,:,k]` is the Y-vector for mode (i,k), not `Shat[i,:,k]`),
-  2. test passed 3D where the solver expects batched 4D (`0.5*S[None,...]`).
-- **Uniform + stretched `rel_rmse`: NOT yet captured.** The last `execute_cell(76)` hit a
-  **Jupyter-MCP "server shut down"** (client-side streamable-http session drop; the jupyter backend
-  on :8888 was healthy — 200 on `/api`). The test numbers are still to be recorded.
+- [ ] **Cell 1:** build `L_y` (flux-form tridiagonal) for a y-grid; verify symmetry, verify
+      uniform limit = standard Laplacian, verify `L_y·cos(πy/Ly) ≈ −(π/Ly)²·cos(πy/Ly)` (1D).
+- [ ] **Cell 2:** 1D solve `(L_y − λI)p = s` on a cosine, uniform + stretched, isolate y-operator.
+- [ ] **Cell 3:** full 3D solve (FFT x/z → per-mode dense solve → IFFT x/z) + **uniform test** → ~1e-10.
+- [ ] **Cell 4:** **stretched test** → small rel_rmse (+ optional convergence check).
+- [ ] (Optional) if accuracy matters later, revisit a higher-order y-discretization — but
+      only after the clean 2nd-order solver is verified.
 
-## Next steps
-1. Re-establish the Jupyter-MCP session, then `execute_cell(76)` to record
-   `rel_rmse` (uniform should be ~1e-8; stretched should drop from ~0.2 to ~1e-6).
-2. If the stretched error is still high, the likely gaps are: (a) the missing INcompact3d
-   `transx·transy·transz` coupling (only matters near Nyquist — unlikely for this low-mode test), or
-   (b) the exact `pp4y` metric convention — cross-check against `src/stretching.f90`.
-3. (Optional, perf) Replace the dense per-mode solve with INcompact3d's even/odd split into two
-   pentadiagonal `solve_banded((2,2))` systems (see the PERF NOTE in cell 73 and the
-   `matrice_refinement`/`inversion5_v1` code) — only if performance ever matters.
+---
+
+## Appendix — Why the INcompact3d-faithful route was dropped (2026-07-08)
+
+We spent a session trying to replicate `poisson_010` exactly (compact `wp` symbol, `yky`
+eigenvalues, pentadiagonal `A_y`, and the y "DCT shift"). Findings:
+
+1. **The y "DCT shift" is not a clean invertible step.** The forward (`poisson.f90` L777)
+   maps a mirror-pair `(F[j], F[mirror])` → a value; the "inverse" (L940) does **not** undo
+   it (round-trip fails, `idct(dct(F)) ≠ F`). It is specific to INcompact3d's compact scheme
+   and staggered layout — not a general DFT→DCT conversion, and not verifiable in isolation.
+
+2. **The equation sign is `∇²p = 2Q`, not `-∇²p = 2Q`.** Early plan cells used `-∇²`; the
+   "sign-flipped" diagnostic result (`p_rec ≈ -p_exact`) was this convention mismatch, not a
+   solver bug. (Corrected at the top of this file.)
+
+3. **`build_full_A` already includes `kx²+kz²`;** adding `(kx²+kz²)·I` again double-counted
+   and made every mode singular.
+
+4. The compact-scheme basis ("post-processing" in x/z/y) is an artifact of the compact
+   discretization, not a step in the abstract pressure solve. Replicating it without full
+   understanding kept producing silent failures.
+
+**Conclusion:** build our own clean solver (Path B) that we understand end-to-end. Higher
+accuracy can be added later if needed.
+
+### Key INcompact3d reference lines (for later, if we revisit compact scheme)
+`poisson_010` (L663): fold L688-696, FFT L705, normalize L708-709, Z post L724-738,
+X post L740-755, Y post L761-780, solve L821-897, zero-mean L904-906, Y unshift L923-944,
+X unshift L960-975, Z unshift L977-991, IFFT L994, unfold L1000-1005.
+`matrice_refinement` (L1921+), `waves` (L1530+), `abxyz` (L1480+), `inversion5_v1` (tools.f90 L1225).
 
 ## References
-- `Incompact3d/src/poisson.f90` — `poisson_010` (L663), `matrice_refinement` (L1814+), `waves` (L1530).
-- `Incompact3d/src/schemes.f90` — `...6` coefficients (L891-931).
-- `Incompact3d/src/tools.f90` — `inversion5_v1` (L1225, pentadiagonal solver).
-- `pressure.py::compute_pressure` — the existing banded-in-Y-per-(x,z)-mode pattern we generalized.
-- Notebook: `check_q-pressure.ipynb` cells 64 (grid), 73-76 (new solver + test).
+- `Incompact3d/src/poisson.f90` — the reference implementation (not being replicated, but the
+  source of the grid + the sign convention cross-check).
+- Notebook: `check_q-pressure.ipynb` — cell 14 (Q definition), cell 50 (old uniform solver),
+  cell 64 (stretched grid `incompact_stretch` + `stretched_analytic_test`).
