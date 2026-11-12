@@ -298,15 +298,29 @@ def delete_s3(prefix: str, tag: str):
 
 
 def load_model_from_s3(prefix: str, tag: str, device: str) -> tuple[M4, dict]:
-    """Load a checkpoint, rebuild the architecture, return (model, config)."""
+    """Load a checkpoint, rebuild the architecture, return (model, config).
+
+    If the stored config lacks 'widen', infer it from the state_dict shapes
+    (pre_widen.0.weight = (widen, 32, 3, 3)).
+    """
     import io
     buf = _s3fs().cat_file(checkpoint_key(prefix, tag))
     ckpt = torch.load(io.BytesIO(buf), map_location="cpu")
-    cfg = ckpt["config"]
-    widen = int(cfg.get("widen", 0))   # stored as the int (0 = off)
+    cfg = dict(ckpt["config"])
+    sd = ckpt["model_state_dict"]
+
+    if "widen" in cfg and cfg["widen"]:
+        widen = int(cfg["widen"])
+    elif "pre_widen.0.weight" in sd:
+        # pre_widen: Conv2d(32, widen) -> weight shape (widen, 32, 3, 3)
+        widen = int(sd["pre_widen.0.weight"].shape[0])
+    else:
+        widen = 0
+    cfg["widen"] = widen
+
     model = M4(lift_width=cfg["lift_width"], c3d=cfg["c3d"],
                n_blocks=cfg["n_blocks"], widen=widen).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(sd)
     model.eval()
     return model, cfg
 
