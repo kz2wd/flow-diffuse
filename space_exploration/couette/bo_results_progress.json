@@ -1,10 +1,10 @@
 {
-  "updated": "2026-11-12T17:20:36.229515",
+  "updated": "2026-11-12T18:29:23.288927",
   "n_trials": 20,
   "epochs": 20,
   "n_warm_start": 13,
   "mode": "ax-bo",
-  "n_done": 12,
+  "n_done": 20,
   "best": {
     "arch": {
       "lift_width": 32,
@@ -146,6 +146,94 @@
       "val_mse": 0.21877093960841495,
       "n_params": 1909580,
       "best_epoch": 19
+    },
+    {
+      "arch": {
+        "lift_width": 79,
+        "c3d": 128,
+        "n_blocks": 6,
+        "widen": 32
+      },
+      "val_mse": 0.9171691205104192,
+      "n_params": 6095650,
+      "best_epoch": 19
+    },
+    {
+      "arch": {
+        "lift_width": 44,
+        "c3d": 39,
+        "n_blocks": 9,
+        "widen": 32
+      },
+      "val_mse": 0.21620801255106925,
+      "n_params": 1176117,
+      "best_epoch": 19
+    },
+    {
+      "arch": {
+        "lift_width": 34,
+        "c3d": 128,
+        "n_blocks": 8,
+        "widen": 1
+      },
+      "val_mse": 0.9171824183066686,
+      "n_params": 7108712,
+      "best_epoch": 19
+    },
+    {
+      "arch": {
+        "lift_width": 37,
+        "c3d": 128,
+        "n_blocks": 8,
+        "widen": 32
+      },
+      "val_mse": 0.9170554693539937,
+      "n_params": 7459704,
+      "best_epoch": 14
+    },
+    {
+      "arch": {
+        "lift_width": 32,
+        "c3d": 62,
+        "n_blocks": 9,
+        "widen": 0
+      },
+      "val_mse": 0.23269605949521066,
+      "n_params": 2183971,
+      "best_epoch": 18
+    },
+    {
+      "arch": {
+        "lift_width": 34,
+        "c3d": 61,
+        "n_blocks": 5,
+        "widen": 0
+      },
+      "val_mse": 0.917110497156779,
+      "n_params": 1339033,
+      "best_epoch": 12
+    },
+    {
+      "arch": {
+        "lift_width": 32,
+        "c3d": 33,
+        "n_blocks": 20,
+        "widen": 64
+      },
+      "val_mse": 0.9170452853043874,
+      "n_params": 1811429,
+      "best_epoch": 13
+    },
+    {
+      "arch": {
+        "lift_width": 33,
+        "c3d": 57,
+        "n_blocks": 7,
+        "widen": 64
+      },
+      "val_mse": 0.4657606860001882,
+      "n_params": 1884743,
+      "best_epoch": 18
     }
   ]
 }
