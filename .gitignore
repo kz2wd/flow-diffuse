@@ -17,3 +17,4 @@ data/
 .jupyter_ystore.db
 .jupyter/
 opencode.json
+*.pth
