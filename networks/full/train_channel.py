@@ -7,7 +7,9 @@ by `space_exploration/couette/train_run.py`:
   1. As the BO objective:   from train_channel import run_trial; run_trial(params)
   2. From the CLI:          python train_channel.py --params '{"c":128,"n_blocks":6}'
 
-The objective returned is the best val MSE (lower is better).
+The objective returned is the best val MSE (lower is better). Trackio runs also
+log validation MSE contributions by XZ Fourier band and paired power spectra
+for fixed validation samples at the midpoint of the selected y grid.
 
 Differences from `full_2.ipynb`:
   - The whole dataset is assumed to fit in RAM (loaded once up front), so we
@@ -35,6 +37,13 @@ import zarr
 import s3fs
 from tqdm.auto import tqdm
 
+if __package__:
+    from .channel_metrics import SpectralValidation, render_spectral_slice
+    from .channel_model import make_model
+else:  # CLI and notebooks importing train_channel directly
+    from channel_metrics import SpectralValidation, render_spectral_slice
+    from channel_model import make_model
+
 # ---------------------------------------------------------------------------
 # S3 / dataset location (matches full_2.ipynb)
 # ---------------------------------------------------------------------------
@@ -60,6 +69,8 @@ NUM_WORKERS = 16
 SCHEDULER_PATIENCE = 3      # epochs without val improvement before dropping LR
 SCHEDULER_FACTOR = 0.5      # LR multiplier on plateau
 SCHEDULER_MIN_LR = 1e-6
+SPECTRAL_IMAGE_SAMPLES = 2
+SPECTRAL_IMAGE_EVERY = 5
 
 
 # ---------------------------------------------------------------------------
@@ -284,48 +295,6 @@ def make_dataloaders(x: torch.Tensor, y: torch.Tensor,
     return dl, normalized_batches
 
 
-# ---------------------------------------------------------------------------
-# Model (full_2.ipynb DataNet)
-# ---------------------------------------------------------------------------
-class ConvBlock3D(nn.Module):
-    def __init__(self, ch):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv3d(ch, ch, 3, padding="same"),
-            nn.SiLU(),
-            nn.Conv3d(ch, ch, 3, padding="same"),
-            nn.SiLU(),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class DataNet(nn.Module):
-    def __init__(self, c: int = 64, n_blocks: int = 3, dy: int = 129, out_ch: int = 3):
-        super().__init__()
-        self.dy = dy
-        self.c = c
-        self.core = nn.Sequential(
-            nn.Conv3d(1, c, 3, padding="same"),
-            *[ConvBlock3D(c) for _ in range(n_blocks)],
-            nn.Conv3d(c, out_ch, 3, padding="same"),
-        )
-
-    def forward(self, p):
-        x = p.expand(-1, -1, -1, self.dy, -1)
-        return self.core(x)
-
-
-def make_model(arch: dict, device: str) -> DataNet:
-    model = DataNet(
-        c=int(arch.get("c", 64)),
-        n_blocks=int(arch.get("n_blocks", 3)),
-        dy=int(arch.get("dy", 129)),
-        out_ch=int(arch.get("out_ch", 3)),
-    ).to(device)
-    return model
-
 
 # ---------------------------------------------------------------------------
 # S3 checkpoint helpers (best-only, like train_run.py)
@@ -362,15 +331,19 @@ def delete_s3(prefix: str, tag: str):
 # ---------------------------------------------------------------------------
 # Train / eval
 # ---------------------------------------------------------------------------
-def _val_mse(model, normalized_batches, val_dl, loss_fn) -> float:
+def _val_mse(model, normalized_batches, val_dl, loss_fn,
+             spectral: SpectralValidation | None = None) -> float:
     model.eval()
     tot = 0.0
     with torch.no_grad():
         pbar = tqdm(normalized_batches(val_dl), total=len(val_dl),
                     desc="Validation", unit="batch", file=sys.stdout)
         for batch_num, (x, y) in enumerate(pbar, start=1):
-            l = loss_fn(model(x), y).item()
-            tot += l
+            prediction = model(x)
+            tot += loss_fn(prediction, y).item()
+            if spectral is not None:
+                spectral.update(prediction, y)
+            del prediction
             pbar.set_postfix(loss=f"{tot / batch_num:.4f}", refresh=False)
     return tot / len(val_dl)
 
@@ -391,11 +364,13 @@ def _run_epoch(model, opti, loss_fn, normalized_batches, train_dl):
 
 
 def _trackio_log(trial_label: str, epoch: int, train_err: float, val_mse: float,
-                 arch: dict, best_so_far: float, lr_now: float):
+                 arch: dict, best_so_far: float, lr_now: float,
+                 spectral: SpectralValidation, channel_names: tuple[str, ...],
+                 *, verbose: bool = False):
     """Log a training step to a Trackio dashboard (best-effort)."""
     try:
         import trackio
-        trackio.log({
+        metrics = {
             "epoch": epoch,
             "train/mse": train_err,
             "val/mse": val_mse,
@@ -406,9 +381,22 @@ def _trackio_log(trial_label: str, epoch: int, train_err: float, val_mse: float,
             "arch/n_blocks": arch["n_blocks"],
             "arch/dy": arch["dy"],
             "trial": trial_label,
-        })
-    except Exception:
-        pass  # tracking is optional; never let it break training
+            **spectral.scalars(),
+        }
+        try:
+            for sample, power in enumerate(spectral.slices):
+                metrics[f"val/spectral_xz/sample_{sample}"] = trackio.Image(
+                    render_spectral_slice(power, channel_names),
+                    caption=f"Validation sample {sample}, y index {spectral.y_index} "
+                            "(selected grid), normalized fields",
+                )
+        except Exception as e:
+            if verbose:
+                print(f"  [warn] spectral image creation failed: {e}", flush=True)
+        trackio.log(metrics)
+    except Exception as e:
+        if verbose:
+            print(f"  [warn] trackio log failed: {e}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -481,7 +469,9 @@ def run_trial(params: dict, *, data: TrainingData | None = None,
               task: str | None = None, wall: str | None = None,
               half_y: bool | None = None, xz_stride: int | None = None,
               trackio_project: str | None = None,
-              trial_label: str | None = None) -> dict:
+              trial_label: str | None = None,
+              spectral_image_samples: int = SPECTRAL_IMAGE_SAMPLES,
+              spectral_image_every: int = SPECTRAL_IMAGE_EVERY) -> dict:
     """Train one config; return dict with 'val_mse' (objective) + metadata.
 
     Keep the best validation checkpoint under the Trackio project/run path
@@ -492,7 +482,11 @@ def run_trial(params: dict, *, data: TrainingData | None = None,
     Pass `data=load_training_data(...)` to reuse RAM data and statistics across
     trials. Without `data`, this function loads train and validation itself;
     `max_samples`, `task`, `wall`, `half_y`, and `xz_stride` control loading in that case.
+    Set `spectral_image_samples=0` to disable Trackio images. Otherwise, log them
+    on the first epoch, every `spectral_image_every` epochs, and the final epoch.
     """
+    if spectral_image_samples < 0 or spectral_image_every < 1:
+        raise ValueError("spectral_image_samples must be nonnegative and spectral_image_every positive")
     if data is None:
         data = load_training_data(max_samples=max_samples, log=log,
                                   task=DEFAULT_TASK if task is None else task, wall=wall,
@@ -531,7 +525,9 @@ def run_trial(params: dict, *, data: TrainingData | None = None,
                 config={**run_config,
                         "scheduler": "ReduceLROnPlateau",
                         "patience": SCHEDULER_PATIENCE,
-                        "factor": SCHEDULER_FACTOR},
+                        "factor": SCHEDULER_FACTOR,
+                        "spectral_image_samples": spectral_image_samples,
+                        "spectral_image_every": spectral_image_every},
             )
         except Exception as e:
             if log:
@@ -564,19 +560,26 @@ def run_trial(params: dict, *, data: TrainingData | None = None,
     best_epoch = -1
     interrupted_checkpoint_uri = None
     epoch = -1
+    channel_names = ("Q",) if data.task == "wall_pressure_to_q" else ("u", "v", "w")
     try:
         for epoch in range(epochs):
             train_err = _run_epoch(model, opti, loss_fn, train_batches, train_dl)
-            val_mse = _val_mse(model, val_batches, val_dl, loss_fn)
+            spectral = None
+            if trackio_run is not None:
+                log_images = (epoch == 0 or (epoch + 1) % spectral_image_every == 0
+                              or epoch == epochs - 1)
+                spectral = SpectralValidation(image_samples=spectral_image_samples if log_images else 0)
+            val_mse = _val_mse(model, val_batches, val_dl, loss_fn, spectral)
             scheduler.step(val_mse)
             lr_now = opti.param_groups[0]["lr"]
 
             if log:
                 print(f"  epoch {epoch:3d}  train={train_err:.4f}  val={val_mse:.4f}"
                       f"  lr={lr_now:.2e}", flush=True)
-            if trackio_run is not None:
+            if spectral is not None:
                 _trackio_log(trial_label, epoch, train_err, val_mse, arch,
-                             best_val, lr_now)
+                             min(best_val, val_mse), lr_now, spectral, channel_names,
+                             verbose=log)
 
             if val_mse < best_val:
                 save_model_to_s3(model, prefix, f"best_{epoch:03d}",
@@ -642,6 +645,10 @@ if __name__ == "__main__":
                     help="trackio project name (default: none)")
     ap.add_argument("--label", type=str, default="trial",
                     help="trial label for trackio")
+    ap.add_argument("--spectral-image-samples", type=int, default=SPECTRAL_IMAGE_SAMPLES,
+                    help="fixed validation samples per Trackio image step (0 disables images)")
+    ap.add_argument("--spectral-image-every", type=int, default=SPECTRAL_IMAGE_EVERY,
+                    help="Trackio image interval in epochs (also logs first and last epochs)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -656,6 +663,8 @@ if __name__ == "__main__":
         xz_stride=args.xz_stride,
         trackio_project=args.project,
         trial_label=args.label,
+        spectral_image_samples=args.spectral_image_samples,
+        spectral_image_every=args.spectral_image_every,
         log=not args.quiet,
     )
     print(json.dumps({k: v for k, v in result.items() if k != "model"},
