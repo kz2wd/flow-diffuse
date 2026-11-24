@@ -49,6 +49,8 @@ else:  # CLI and notebooks importing train_channel directly
 # ---------------------------------------------------------------------------
 S3_BUCKET = "simulations"
 STORE_PATH = "flow_export/A1"
+VALIDATION_STORE_PATH = "validation/re200-sr1etot"
+SPINUP_CUTOFF = 200  # Exclude exported snapshot indices 0–199 in both runs.
 S3_ENDPOINT = "http://localhost:8333"
 # Save bucket: a dedicated `models` bucket, `channel-1` prefix
 S3_MODEL_BUCKET = "models"
@@ -83,18 +85,25 @@ def _s3fs():
     )
 
 
-def _open_data_zarr():
-    return zarr.open(
-        store=s3fs.S3Map(root=f"{S3_BUCKET}/{STORE_PATH}/data.zarr", s3=_s3fs()),
-        mode="r",
-    )
+def _open_run_array(store_path: str, array_path: str):
+    key = f"{S3_BUCKET}/{store_path}/{array_path}"
+    fsspec_store = getattr(zarr.storage, "FsspecStore", None)
+    if fsspec_store is not None:
+        store = fsspec_store.from_url(
+            f"s3://{key}", storage_options={"client_kwargs": {"endpoint_url": S3_ENDPOINT}},
+            read_only=True,
+        )
+    else:
+        store = s3fs.S3Map(root=key, s3=_s3fs(), check=False)
+    return zarr.open_array(store=store, mode="r")
 
 
-def _open_channel_zarr():
-    return zarr.open(
-        store=s3fs.S3Map(root=f"{S3_BUCKET}/{STORE_PATH}/channel.zarr", s3=_s3fs()),
-        mode="r",
-    )
+def _open_data_zarr(store_path: str = STORE_PATH):
+    return _open_run_array(store_path, "data.zarr")
+
+
+def _open_channel_axis(store_path: str, axis: str):
+    return _open_run_array(store_path, f"channel.zarr/{axis}")[:]
 
 
 def _range_to_slice(r: range) -> slice:
@@ -141,8 +150,25 @@ def compute_splits(T: int,
     return {"train": train_range, "val": val_range, "test": test_range}
 
 
+def select_training_ranges(train_length: int, validation_length: int, *,
+                           max_samples: int | None = None) -> dict[str, range]:
+    """Trim the existing A1 train window; leave the original A1 test tail intact."""
+    if train_length <= SPINUP_CUTOFF or validation_length <= SPINUP_CUTOFF:
+        raise ValueError(f"Both stores must contain snapshots after the spin-up cutoff {SPINUP_CUTOFF}")
+    if max_samples is not None and max_samples < 1:
+        raise ValueError("max_samples must be positive")
+    a1 = compute_splits(train_length)
+    train = a1["train"]
+    # Do not expand into the former A1 validation block when skipping spin-up.
+    train = train[max(0, (SPINUP_CUTOFF - train.start + train.step - 1) // train.step):]
+    if not train:
+        raise ValueError(f"A1 training window is empty after the spin-up cutoff {SPINUP_CUTOFF}")
+    return {"train": train[:max_samples], "validation": range(SPINUP_CUTOFF, validation_length)[:max_samples],
+            "test": a1["test"]}
+
+
 def load_into_ram(z, idx, in_ch: int, out_ch: int,
-                  chunk: int = 16, workers: int = 8,
+                  chunk: int = 16, workers: int = 16,
                   progress: bool = True, *, out_start_ch: int = 0,
                   wall_y: int | None = None, half_y: bool = False,
                   xz_stride: int = 1):
@@ -199,14 +225,9 @@ def load_into_ram(z, idx, in_ch: int, out_ch: int,
         src_first = r.start + out_start * step
         src_last = r.start + (out_end - 1) * step
         s = slice(src_first, src_last + 1, step)   # zarr accepts a slice
-        import s3fs as _s3fs, zarr as _zarr
-        fs = _s3fs.S3FileSystem(profile="default",
-                                client_kwargs={"endpoint_url": S3_ENDPOINT})
-        za = _zarr.open_array(
-            store=_s3fs.S3Map(root=f"{S3_BUCKET}/{STORE_PATH}/data.zarr", s3=fs),
-            mode="r")
-        xc = np.asarray(za[s, in_ch:in_ch + 1, xz, input_y, xz], dtype=np.float32)
-        yc = np.asarray(za[s, target_channels, xz, target_y, xz], dtype=np.float32)
+        # Read through the caller's array: validation and training are separate stores.
+        xc = np.asarray(z[s, in_ch:in_ch + 1, xz, input_y, xz], dtype=np.float32)
+        yc = np.asarray(z[s, target_channels, xz, target_y, xz], dtype=np.float32)
         return out_start, xc, yc
 
     rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KiB on Linux
@@ -413,6 +434,7 @@ class TrainingData:
     wall: str | None = None
     half_y: bool = False
     xz_stride: int = 1
+    selection: dict | None = None
 
 
 def load_training_data(*, max_samples: int | None = None, log: bool = False,
@@ -431,34 +453,47 @@ def load_training_data(*, max_samples: int | None = None, log: bool = False,
     elif wall not in ("lower", "upper"):
         raise ValueError("wall must be 'lower' or 'upper'")
 
-    z = _open_data_zarr()
-    T = z.shape[0]
+    z = _open_data_zarr(STORE_PATH)
+    validation_z = _open_data_zarr(VALIDATION_STORE_PATH)
     in_ch, out_start_ch, out_ch = TASK_CHANNELS[task]
+    for path, array in ((STORE_PATH, z), (VALIDATION_STORE_PATH, validation_z)):
+        if len(array.shape) != 5 or array.shape[1] < max(in_ch + 1, out_start_ch + out_ch):
+            raise ValueError(f"Invalid Zarr shape {array.shape} at {path} for task {task!r}")
+    if z.shape[2:] != validation_z.shape[2:]:
+        raise ValueError("Training and validation spatial grid shapes differ")
+    ranges = select_training_ranges(z.shape[0], validation_z.shape[0], max_samples=max_samples)
+    for axis, size in zip("xyz", z.shape[2:]):
+        train_axis = _open_channel_axis(STORE_PATH, axis)
+        val_axis = _open_channel_axis(VALIDATION_STORE_PATH, axis)
+        if (train_axis.shape != (size,) or val_axis.shape != (size,)
+                or not np.isfinite(train_axis).all() or not np.isfinite(val_axis).all()
+                or not np.allclose(train_axis, val_axis, rtol=1e-7, atol=1e-10)):
+            raise ValueError(f"Training and validation grid coordinates differ or are invalid on {axis}")
     wall_y = None if wall is None else 0 if wall == "lower" else z.shape[3] - 1
-    if z.shape[1] < max(in_ch + 1, out_start_ch + out_ch):
-        raise ValueError(f"Zarr array has too few channels for task {task!r}")
-    splits = compute_splits(T)
-    train_range = splits["train"][:max_samples]
-    val_range = splits["val"][:max_samples]
-    if not train_range or not val_range:
-        raise ValueError(f"Expected nonempty train and validation splits for T={T}")
+    data_selection = {}
+    for name, selected in ranges.items():
+        path = VALIDATION_STORE_PATH if name == "validation" else STORE_PATH
+        data_selection[name] = {"uri": f"s3://{S3_BUCKET}/{path}/data.zarr",
+                                "slice": [selected.start, selected.stop, selected.step],
+                                "snapshots": len(selected), "loaded": name != "test"}
     if log:
         print(f"  task={task}  wall={wall}  half_y={half_y}  xz_stride={xz_stride}  "
-              f"T={T}  max_samples={max_samples}", flush=True)
-        for name, selected in (("train", train_range), ("val", val_range), ("test", splits["test"])):
-            status = "held out, not loaded" if name == "test" else "loading"
-            print(f"  {name}: [{selected.start}:{selected.stop}:{selected.step}] "
-                  f"({len(selected)}/{len(splits[name])} snapshots; {status})", flush=True)
+              f"max_samples={max_samples}  spin-up cutoff={SPINUP_CUTOFF}", flush=True)
+        for name, meta in data_selection.items():
+            status = "loading" if meta["loaded"] else "held out, not loaded"
+            print(f"  {name}: {meta['uri']} [{':'.join(map(str, meta['slice']))}] "
+                  f"({meta['snapshots']} snapshots; {status})", flush=True)
 
     selection = dict(in_ch=in_ch, out_ch=out_ch, out_start_ch=out_start_ch,
                      wall_y=wall_y, half_y=half_y, xz_stride=xz_stride)
-    xtr, ytr = load_into_ram(z, train_range, **selection)
-    xva, yva = load_into_ram(z, val_range, **selection)
+    xtr, ytr = load_into_ram(z, ranges["train"], progress=log, **selection)
+    xva, yva = load_into_ram(validation_z, ranges["validation"], progress=log, **selection)
     x_mean, x_std = _channel_stats(xtr)
     y_mean, y_std = _channel_stats(ytr)
     return TrainingData(train=(xtr, ytr), val=(xva, yva),
                         x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std,
-                        task=task, wall=wall, half_y=half_y, xz_stride=xz_stride)
+                        task=task, wall=wall, half_y=half_y, xz_stride=xz_stride,
+                        selection=data_selection)
 
 
 def run_trial(params: dict, *, data: TrainingData | None = None,
@@ -510,7 +545,7 @@ def run_trial(params: dict, *, data: TrainingData | None = None,
         raise ValueError(f"dy={arch['dy']} does not match target depth {target.shape[3]}")
     run_config = {"arch": arch, "task": data.task, "wall": data.wall,
                   "half_y": data.half_y, "xz_stride": data.xz_stride,
-                  "epochs": epochs, "lr": lr}
+                  "epochs": epochs, "lr": lr, "data_selection": data.selection}
 
     if log:
         print(f"[trial] {run_config}", flush=True)
