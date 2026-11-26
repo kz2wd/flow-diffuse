@@ -1,0 +1,25 @@
+{"project": "channel_full3_ptov", "architectures": [{"c": 128, "n_blocks": 5}, {"c": 128, "n_blocks": 10}], "epochs": 20, "batch_size": 4, "lr": 0.0001, "patience": 1, "threshold": 0.1, "train": [200, 3196, 1], "validation": [200, 1001, 1], "cuda_available": true}
+CUDA device: NVIDIA RTX 6000 Ada Generation
+  task=wall_pressure_to_velocity  wall=lower  half_y=True  xz_stride=1  max_samples=5000  spin-up cutoff=200
+  train: s3://simulations/flow_export/A1/data.zarr [200:3196:1] (2996 snapshots; loading)
+  validation: s3://simulations/validation/re200-sr1etot/data.zarr [200:1001:1] (801 snapshots; loading)
+  test: s3://simulations/flow_export/A1/data.zarr [3607:3999:1] (392 snapshots; held out, not loaded)
+Load Zarr:   0%|          | 0/188 [00:00<?, ?chunk/s]Load Zarr:   1%|          | 1/188 [00:37<1:55:51, 37.18s/chunk]Load Zarr:   1%|          | 2/188 [00:38<50:25, 16.27s/chunk]  Load Zarr:   2%|▏         | 3/188 [00:40<29:55,  9.70s/chunk]Load Zarr:   2%|▏         | 4/188 [00:42<20:09,  6.57s/chunk]Load Zarr:   3%|▎         | 5/188 [00:44<15:33,  5.10s/chunk]Load Zarr:   3%|▎         | 6/188 [00:48<13:31,  4.46s/chunk]Load Zarr:   4%|▎         | 7/188 [00:50<11:43,  3.89s/chunk]Load Zarr:   4%|▍         | 8/188 [00:54<11:05,  3.70s/chunk]Load Zarr:   5%|▍         | 9/188 [00:57<10:32,  3.53s/chunk]Load Zarr:   5%|▌         | 10/188 [00:59<09:37,  3.25s/chunk]Load Zarr:   6%|▌         | 11/188 [01:02<08:34,  2.91s/chunk]Load Zarr:   6%|▋         | 12/188 [01:03<07:25,  2.53s/chunk]Load Zarr:   7%|▋         | 13/188 [01:05<06:58,  2.39s/chunk]Load Zarr:   7%|▋         | 14/188 [01:07<06:31,  2.25s/chunk]Load Zarr:   8%|▊         | 15/188 [01:09<06:07,  2.12s/chunk]Load Zarr:   9%|▊         | 16/188 [01:11<05:59,  2.09s/chunk]Load Zarr:   9%|▉         | 17/188 [01:43<31:10, 10.94s/chunk]Load Zarr:  10%|▉         | 18/188 [01:45<23:22,  8.25s/chunk]Load Zarr:  10%|█         | 19/188 [01:46<17:40,  6.28s/chunk]Load Zarr:  11%|█         | 20/188 [01:48<13:59,  5.00s/chunk]Load Zarr:  11%|█         | 20/188 [01:49<15:23,  5.50s/chunk]
+Traceback (most recent call last):
+  File "/data3/chancrin/code/flow-diffuse/networks/full/.full3-width128-lr1e4-job/run_full3_width128.py", line 112, in <module>
+    if __name__=='__main__':main()
+  File "/data3/chancrin/code/flow-diffuse/networks/full/.full3-width128-lr1e4-job/run_full3_width128.py", line 83, in main
+    data=tr.load_training_data(task='wall_pressure_to_velocity',max_samples=5000,half_y=True,xz_stride=1,log=True)
+  File "/data3/chancrin/code/flow-diffuse/networks/full/train_channel.py", line 489, in load_training_data
+    xtr, ytr = load_into_ram(z, ranges["train"], progress=log, **selection)
+  File "/data3/chancrin/code/flow-diffuse/networks/full/train_channel.py", line 241, in load_into_ram
+    for fut in completed:
+  File "/data3/chancrin/code/flow-diffuse/.venv/lib/python3.10/site-packages/tqdm/std.py", line 1188, in __iter__
+    for obj in iterable:
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 245, in as_completed
+    waiter.event.wait(wait_timeout)
+  File "/usr/lib/python3.10/threading.py", line 607, in wait
+    signaled = self._cond.wait(timeout)
+  File "/usr/lib/python3.10/threading.py", line 320, in wait
+    waiter.acquire()
+KeyboardInterrupt

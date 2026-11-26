@@ -1,0 +1,31 @@
+{
+  "algorithm": "train_channel_global_float32_ddof1_1e-6_v1",
+  "dtype": "float32",
+  "endpoint": "http://localhost:8333",
+  "geometry": {
+    "in_ch": 3,
+    "out_ch": 3,
+    "out_start": 0,
+    "wall_index": 0
+  },
+  "grid_sha256": [
+    "279157ed099957fd0573dd5eb31d7f42a365ab0c182bea54e057839ba0ce1585",
+    "97be537ae70467390f0bad3e48a6eb7f69f47f4ad2d190f8f566146ae45e02f1",
+    "cd43fb3f4a6e6a0a2bdd01e50d64108b82fbeaf2bc2937c79415c2bdea8fc002"
+  ],
+  "n_out": 3,
+  "shape": [
+    5,
+    128,
+    129,
+    128
+  ],
+  "slice": [
+    200,
+    3196,
+    1
+  ],
+  "stride": 1,
+  "target_depth": 65,
+  "uri": "s3://simulations/flow_export/A1/data.zarr"
+}
